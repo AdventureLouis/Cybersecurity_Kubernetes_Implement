@@ -1,0 +1,181 @@
+version: "3"
+
+env:
+  NAMESPACE: threat-detection
+  AWS_REGION: us-east-1
+
+tasks:
+  create-namespace:
+    desc: Create the threat-detection namespace
+    cmds:
+      - kubectl apply -f namespace.yaml
+    silent: false
+
+  deploy-service-account:
+    desc: Deploy the service account with IRSA
+    cmds:
+      - |
+        export EKS_POD_ROLE_ARN=$(cd ../terraform && terraform output -raw eks_pod_role_arn)
+        envsubst < service-account.yaml | kubectl apply -f -
+    deps: [create-namespace]
+
+  deploy-api-service:
+    desc: Deploy the API service
+    cmds:
+      - |
+        export DOCKERHUB_USERNAME=$(cd ../terraform && terraform output -raw dockerhub_api_image | cut -d'/' -f1)
+        envsubst < api-service/deployment.yaml | kubectl apply -f -
+      - kubectl apply -f api-service/service.yaml
+    deps: [deploy-service-account]
+
+  deploy-inference-service:
+    desc: Deploy the Inference service
+    cmds:
+      - |
+        export DOCKERHUB_USERNAME=$(cd ../terraform && terraform output -raw dockerhub_inference_image | cut -d'/' -f1)
+        if [ -z "${SAGEMAKER_ENDPOINT_NAME:-}" ]; then
+          SAGEMAKER_ENDPOINT_NAME=$(aws sagemaker list-endpoints --region ${AWS_REGION} \
+            --query "Endpoints[?starts_with(EndpointName,'threat-detection-endpoint') && EndpointStatus=='InService'] | sort_by(@, &CreationTime) | [-1].EndpointName" --output text 2>/dev/null || echo "")
+          if [ -z "$SAGEMAKER_ENDPOINT_NAME" ] || [ "$SAGEMAKER_ENDPOINT_NAME" = "None" ]; then
+            echo "⚠️  No InService SageMaker endpoint found. Using default name."
+            echo "   Run 'python scripts/automated_training.py' to create one."
+            SAGEMAKER_ENDPOINT_NAME="threat-detection-endpoint"
+          else
+            echo "🔍 Auto-detected SageMaker endpoint: $SAGEMAKER_ENDPOINT_NAME"
+          fi
+        fi
+        export SAGEMAKER_ENDPOINT_NAME
+        envsubst < inference-service/deployment.yaml | kubectl apply -f -
+      - kubectl apply -f inference-service/service.yaml
+    deps: [deploy-service-account]
+
+  deploy-ingress:
+    desc: Deploy the ALB Ingress
+    cmds:
+      - |
+        ACM_CERTIFICATE_ARN=$(aws acm list-certificates --region ${AWS_REGION} \
+          --query "CertificateSummaryList[?DomainName=='lab-loui.org' && Status=='ISSUED'].CertificateArn" --output text 2>/dev/null || echo "")
+        if [ -n "$ACM_CERTIFICATE_ARN" ]; then
+          echo "🔒 Deploying with HTTPS (ACM: $ACM_CERTIFICATE_ARN)"
+          export ACM_CERTIFICATE_ARN
+          envsubst < ingress/ingress.yaml | kubectl apply -f -
+        else
+          echo "⚠️  No ISSUED ACM certificate found. Deploying HTTP-only."
+          echo "   Run 'task acm:setup' to enable HTTPS."
+          kubectl apply -f - <<EOF
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: threat-detection-ingress
+          namespace: threat-detection
+          annotations:
+            kubernetes.io/ingress.class: alb
+            alb.ingress.kubernetes.io/scheme: internet-facing
+            alb.ingress.kubernetes.io/target-type: ip
+            alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+            alb.ingress.kubernetes.io/healthcheck-path: /health
+            alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.drop_invalid_header_fields.enabled=true
+            alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+            alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+            alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+            alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+            alb.ingress.kubernetes.io/tags: "Environment=production,App=threat-detection"
+          labels:
+            app: threat-detection
+        spec:
+          ingressClassName: alb
+          rules:
+            - http:
+                paths:
+                  - path: /predict
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: api-service
+                        port:
+                          number: 8000
+                  - path: /health
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: api-service
+                        port:
+                          number: 8000
+        EOF
+        fi
+    deps: [deploy-api-service, deploy-inference-service]
+
+  deploy-all:
+    desc: Deploy all K8s resources
+    cmds:
+      - task: create-namespace
+      - task: deploy-service-account
+      - task: deploy-api-service
+      - task: deploy-inference-service
+      - task: deploy-ingress
+      - echo "✅ All K8s resources deployed!"
+      - echo "⏳ Waiting for ALB to be provisioned..."
+      - sleep 10
+      - kubectl get ingress -n ${NAMESPACE}
+
+  status:
+    desc: Show status of all resources in the namespace
+    cmds:
+      - echo "=== Namespace ==="
+      - kubectl get ns ${NAMESPACE}
+      - echo ""
+      - echo "=== Pods ==="
+      - kubectl get pods -n ${NAMESPACE}
+      - echo ""
+      - echo "=== Services ==="
+      - kubectl get svc -n ${NAMESPACE}
+      - echo ""
+      - echo "=== Ingress ==="
+      - kubectl get ingress -n ${NAMESPACE}
+      - echo ""
+      - echo "=== Deployments ==="
+      - kubectl get deployments -n ${NAMESPACE}
+
+  logs-api:
+    desc: View API service logs
+    cmds:
+      - kubectl logs -n ${NAMESPACE} -l app=api-service --tail=50 -f
+
+  logs-inference:
+    desc: View Inference service logs
+    cmds:
+      - kubectl logs -n ${NAMESPACE} -l app=inference-service --tail=50 -f
+
+  get-alb-url:
+    desc: Get the ALB URL
+    cmds:
+      - |
+        ALB_URL=$(kubectl get ingress -n ${NAMESPACE} threat-detection-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+        if [ -n "$ALB_URL" ]; then
+          echo "🌐 ALB URL: http://$ALB_URL"
+          echo "🔒 ALB URL: https://$ALB_URL"
+          echo ""
+          echo "API Endpoint: https://$ALB_URL/predict"
+        else
+          echo "⏳ ALB not ready yet. Wait a few minutes and try again."
+        fi
+
+  restart-api:
+    desc: Restart API service pods
+    cmds:
+      - kubectl rollout restart deployment/api-service -n ${NAMESPACE}
+
+  restart-inference:
+    desc: Restart Inference service pods
+    cmds:
+      - kubectl rollout restart deployment/inference-service -n ${NAMESPACE}
+
+  delete-all:
+    desc: Delete all K8s resources
+    cmds:
+      - kubectl delete ingress --all -n ${NAMESPACE} --ignore-not-found
+      - kubectl delete svc --all -n ${NAMESPACE} --ignore-not-found
+      - kubectl delete deployment --all -n ${NAMESPACE} --ignore-not-found
+      - kubectl delete sa threat-detection-sa -n ${NAMESPACE} --ignore-not-found
+      - kubectl delete ns ${NAMESPACE} --ignore-not-found
+      - echo "✅ All K8s resources deleted!"

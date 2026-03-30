@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-service
+  namespace: threat-detection
+  labels:
+    app: inference-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: inference-service
+  template:
+    metadata:
+      labels:
+        app: inference-service
+    spec:
+      serviceAccountName: threat-detection-sa
+      containers:
+        - name: inference-service
+          image: "${DOCKERHUB_USERNAME}/threat-detection-inference:latest"
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: SAGEMAKER_ENDPOINT_NAME
+              value: "${SAGEMAKER_ENDPOINT_NAME}"
+            - name: AWS_REGION
+              value: "us-east-1"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Threat Detection</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+            padding: 20px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.15);
+            margin-bottom: 30px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 15px;
+        }
+        .header p { color: #666; font-size: 1rem; }
+        .input-card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(15px);
+            border-radius: 25px;
+            padding: 50px;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        .input-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #667eea, #764ba2, #667eea);
+            background-size: 200% 100%;
+            animation: shimmer 3s ease-in-out infinite;
+        }
+        @keyframes shimmer {
+            0%, 100% { background-position: 200% 0; }
+            50% { background-position: -200% 0; }
+        }
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .feature-group { display: flex; flex-direction: column; gap: 8px; }
+        .feature-group label { font-weight: 500; color: #333; font-size: 0.9rem; }
+        .feature-group input {
+            padding: 15px 18px;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        }
+        .feature-group input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.15), 0 4px 12px rgba(0, 0, 0, 0.1);
+            transform: translateY(-1px);
+        }
+        .feature-group input:hover {
+            border-color: #d1d5db;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.08);
+        }
+        .analyze-btn {
+            width: 100%;
+            padding: 18px 35px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            border-radius: 15px;
+            font-size: 1.2rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            position: relative;
+            overflow: hidden;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .analyze-btn::before {
+            content: '';
+            position: absolute;
+            top: 0; left: -100%;
+            width: 100%; height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: left 0.5s;
+        }
+        .analyze-btn:hover::before { left: 100%; }
+        .analyze-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 35px rgba(102, 126, 234, 0.4);
+        }
+        .analyze-btn:active { transform: translateY(-1px); }
+        .loading { opacity: 0.7; pointer-events: none; }
+        @media (max-width: 768px) {
+            .feature-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1><i class="fas fa-shield-alt"></i> Threat Detection</h1>
+            <p>AI-Powered Network Security Analysis</p>
+        </div>
+        <div class="input-card">
+            <form id="threatForm">
+                <div class="feature-grid">
+                    <div class="feature-group">
+                        <label>Duration</label>
+                        <input type="number" id="duration" placeholder="0" step="0.01" value="0">
+                    </div>
+                    <div class="feature-group">
+                        <label>Protocol Type</label>
+                        <input type="number" id="protocol_type" placeholder="0-2" min="0" max="2" value="1">
+                    </div>
+                    <div class="feature-group">
+                        <label>Service</label>
+                        <input type="number" id="service" placeholder="0-4" min="0" max="4" value="0">
+                    </div>
+                    <div class="feature-group">
+                        <label>Flag</label>
+                        <input type="number" id="flag" placeholder="0-3" min="0" max="3" value="0">
+                    </div>
+                    <div class="feature-group">
+                        <label>Source Bytes</label>
+                        <input type="number" id="src_bytes" placeholder="0" value="181">
+                    </div>
+                    <div class="feature-group">
+                        <label>Destination Bytes</label>
+                        <input type="number" id="dst_bytes" placeholder="0" value="5450">
+                    </div>
+                </div>
+                <button type="submit" class="analyze-btn" id="analyzeBtn">
+                    <i class="fas fa-search"></i>
+                    <span id="btnText">Analyze Threat</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // ALB_ENDPOINT will be replaced by the deploy script with the actual ALB URL
+        const API_ENDPOINT = '%%ALB_ENDPOINT%%/predict';
+
+        document.getElementById('threatForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const btn = document.getElementById('analyzeBtn');
+            const btnText = document.getElementById('btnText');
+
+            const userFeatures = [
+                parseFloat(document.getElementById('duration').value) || 0,
+                parseInt(document.getElementById('protocol_type').value) || 0,
+                parseInt(document.getElementById('service').value) || 0,
+                parseInt(document.getElementById('flag').value) || 0,
+                parseFloat(document.getElementById('src_bytes').value) || 0,
+                parseFloat(document.getElementById('dst_bytes').value) || 0
+            ];
+
+            const redirectToResults = (prediction, score, status) => {
+                const params = new URLSearchParams({
+                    prediction: prediction,
+                    score: score,
+                    status: status,
+                    features: userFeatures.join(',')
+                });
+                window.location.href = 'result.html?' + params.toString();
+            };
+
+            btn.classList.add('loading');
+            btnText.textContent = 'Analyzing...';
+
+            try {
+                const features = [
+                    userFeatures[0] / 100, userFeatures[1] / 10, userFeatures[2] / 10,
+                    userFeatures[3] / 10, userFeatures[4] / 10000, userFeatures[5] / 10000,
+                    0.1, 0.2, 0.3, 0.4
+                ];
+
+                const response = await fetch(API_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ features })
+                });
+
+                if (!response.ok) throw new Error('API returned ' + response.status);
+
+                const result = await response.json();
+                redirectToResults(
+                    result.prediction,
+                    result.raw_score || result.confidence || '0.7500',
+                    result.status || (result.prediction ? 'Attack Detected' : 'Normal Traffic')
+                );
+            } catch (error) {
+                alert('Error: ' + error.message + '\nCheck that the ALB endpoint is reachable.');
+                btn.classList.remove('loading');
+                btnText.textContent = 'Analyze Threat';
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,448 @@
+version: "3"
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: Louis
+
+tasks:
+  # ─── Terraform Tasks ───
+  terraform:init:
+    desc: Initialize Terraform
+    dir: terraform
+    cmds:
+      - terraform init
+
+  terraform:plan:
+    desc: Plan Terraform changes
+    dir: terraform
+    cmds:
+      - terraform plan
+
+  terraform:apply:
+    desc: Apply Terraform infrastructure
+    dir: terraform
+    cmds:
+      - terraform apply -auto-approve
+
+  terraform:destroy:
+    desc: Destroy Terraform infrastructure
+    dir: terraform
+    cmds:
+      - terraform destroy -auto-approve
+
+  terraform:output:
+    desc: Show Terraform outputs
+    dir: terraform
+    cmds:
+      - terraform output
+
+  # ─── Docker Tasks ───
+  docker:login:
+    desc: Login to Docker Hub
+    cmds:
+      - docker login
+
+  docker:build:
+    desc: Build all Docker images
+    dir: terraform
+    cmds:
+      - |
+        DOCKERHUB_USER=$(terraform output -raw dockerhub_api_image | cut -d'/' -f1)
+        docker build --platform linux/amd64 -t "$DOCKERHUB_USER/threat-detection-api:latest" ../docker/api-service/
+        docker build --platform linux/amd64 -t "$DOCKERHUB_USER/threat-detection-inference:latest" ../docker/inference-service/
+        echo "✅ Docker images built"
+
+  docker:push:
+    desc: Push all Docker images to Docker Hub
+    deps: [docker:login]
+    dir: terraform
+    cmds:
+      - |
+        DOCKERHUB_USER=$(terraform output -raw dockerhub_api_image | cut -d'/' -f1)
+        docker push "$DOCKERHUB_USER/threat-detection-api:latest"
+        docker push "$DOCKERHUB_USER/threat-detection-inference:latest"
+        echo "✅ Docker images pushed to Docker Hub"
+
+  docker:build-push:
+    desc: Build and push all Docker images
+    cmds:
+      - task: docker:build
+      - task: docker:push
+
+  # ─── ACM / HTTPS Tasks ───
+  acm:setup:
+    desc: Create ACM certificate with Route 53 DNS validation
+    cmds:
+      - |
+        DOMAIN="lab-loui.org"
+        REGION="${AWS_REGION}"
+
+        # Get hosted zone ID
+        ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
+          --query 'HostedZones[0].Id' --output text | sed 's|/hostedzone/||')
+        if [ -z "$ZONE_ID" ]; then
+          echo "❌ No Route 53 hosted zone found for $DOMAIN"
+          exit 1
+        fi
+
+        # Sync nameservers: ensure domain registration points to the hosted zone
+        ZONE_NS=$(aws route53 get-hosted-zone --id "$ZONE_ID" \
+          --query 'DelegationSet.NameServers' --output json)
+        REGISTERED_NS=$(dig "$DOMAIN" NS +short 2>/dev/null | sort)
+        EXPECTED_NS=$(echo "$ZONE_NS" | python3 -c "import sys,json; [print(ns+'.') for ns in sorted(json.load(sys.stdin))]")
+        if [ "$REGISTERED_NS" != "$EXPECTED_NS" ]; then
+          echo "🔄 Nameserver mismatch detected — updating domain registration..."
+          NS_ARGS=$(echo "$ZONE_NS" | python3 -c "import sys,json; print(' '.join(['Name='+ns for ns in json.load(sys.stdin)]))")
+          aws route53domains update-domain-nameservers --region us-east-1 \
+            --domain-name "$DOMAIN" --nameservers $NS_ARGS
+          echo "⏳ Waiting for nameserver propagation..."
+          for i in $(seq 1 12); do
+            if dig "$DOMAIN" NS +short | grep -q awsdns; then
+              echo "✅ Nameservers propagated"
+              break
+            fi
+            echo "   Waiting... ($i/12)"
+            sleep 10
+          done
+        else
+          echo "✅ Nameservers are in sync"
+        fi
+
+        # Check if certificate already exists
+        EXISTING=$(aws acm list-certificates --region $REGION \
+          --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" --output text)
+        if [ -n "$EXISTING" ]; then
+          STATUS=$(aws acm describe-certificate --certificate-arn "$EXISTING" --region $REGION \
+            --query 'Certificate.Status' --output text)
+          echo "⚠️  Certificate already exists: $EXISTING (Status: $STATUS)"
+          if [ "$STATUS" = "ISSUED" ]; then
+            echo "✅ Certificate is ready to use"
+            exit 0
+          fi
+          echo "⏳ Waiting for validation..."
+          CERT_ARN="$EXISTING"
+        else
+          # Request certificate
+          CERT_ARN=$(aws acm request-certificate --region $REGION \
+            --domain-name "$DOMAIN" \
+            --subject-alternative-names "*.$DOMAIN" \
+            --validation-method DNS \
+            --tags Key=Name,Value=ThreatDetection-ALB-Cert \
+            --query 'CertificateArn' --output text)
+          echo "📜 Certificate requested: $CERT_ARN"
+          sleep 5
+        fi
+
+        # Create DNS validation records
+        VALIDATION=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region $REGION \
+          --query 'Certificate.DomainValidationOptions[0]')
+        CNAME_NAME=$(echo "$VALIDATION" | python3 -c "import sys,json; print(json.load(sys.stdin)['ResourceRecord']['Name'])")
+        CNAME_VALUE=$(echo "$VALIDATION" | python3 -c "import sys,json; print(json.load(sys.stdin)['ResourceRecord']['Value'])")
+
+        aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch '{
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "'"$CNAME_NAME"'",
+              "Type": "CNAME",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "'"$CNAME_VALUE"'"}]
+            }
+          }]
+        }' > /dev/null
+        echo "📝 DNS validation record created"
+
+        # Wait for validation
+        echo "⏳ Waiting for certificate validation (this can take 1-30 minutes)..."
+        for i in $(seq 1 60); do
+          STATUS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region $REGION \
+            --query 'Certificate.Status' --output text)
+          if [ "$STATUS" = "ISSUED" ]; then
+            echo "✅ ACM certificate ISSUED: $CERT_ARN"
+            exit 0
+          fi
+          echo "   Status: $STATUS — waiting... ($i/60)"
+          sleep 10
+        done
+        echo "❌ Certificate not issued after 10 minutes. Run 'task acm:status' to check."
+        exit 1
+
+  acm:status:
+    desc: Check ACM certificate status
+    cmds:
+      - |
+        aws acm list-certificates --region ${AWS_REGION} \
+          --query 'CertificateSummaryList[?DomainName==`lab-loui.org`].{ARN:CertificateArn,Status:Status}' \
+          --output table
+
+  acm:destroy:
+    desc: Delete ACM certificate and Route 53 validation records
+    cmds:
+      - |
+        DOMAIN="lab-loui.org"
+        REGION="${AWS_REGION}"
+
+        # Get certificate ARN
+        CERT_ARN=$(aws acm list-certificates --region $REGION \
+          --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" --output text)
+        if [ -z "$CERT_ARN" ]; then
+          echo "ℹ️  No ACM certificate found for $DOMAIN"
+          exit 0
+        fi
+
+        # Get and delete DNS validation record
+        ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
+          --query 'HostedZones[0].Id' --output text | sed 's|/hostedzone/||')
+        if [ -n "$ZONE_ID" ]; then
+          VALIDATION=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region $REGION \
+            --query 'Certificate.DomainValidationOptions[0]' 2>/dev/null)
+          if [ -n "$VALIDATION" ]; then
+            CNAME_NAME=$(echo "$VALIDATION" | python3 -c "import sys,json; print(json.load(sys.stdin)['ResourceRecord']['Name'])" 2>/dev/null || echo "")
+            CNAME_VALUE=$(echo "$VALIDATION" | python3 -c "import sys,json; print(json.load(sys.stdin)['ResourceRecord']['Value'])" 2>/dev/null || echo "")
+            if [ -n "$CNAME_NAME" ] && [ -n "$CNAME_VALUE" ]; then
+              aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch '{
+                "Changes": [{
+                  "Action": "DELETE",
+                  "ResourceRecordSet": {
+                    "Name": "'"$CNAME_NAME"'",
+                    "Type": "CNAME",
+                    "TTL": 300,
+                    "ResourceRecords": [{"Value": "'"$CNAME_VALUE"'"}]
+                  }
+                }]
+              }' > /dev/null 2>&1 && echo "🗑️  DNS validation record deleted" || echo "⚠️  DNS record already removed"
+            fi
+          fi
+        fi
+
+        # Delete certificate
+        aws acm delete-certificate --certificate-arn "$CERT_ARN" --region $REGION
+        echo "✅ ACM certificate deleted: $CERT_ARN"
+
+  # ─── Kubernetes Tasks ───
+  k8s:connect:
+    desc: Connect to EKS cluster
+    cmds:
+      - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+
+  k8s:deploy:
+    desc: Deploy all K8s resources and update api.lab-loui.org DNS
+    dir: k8s
+    cmds:
+      - task --taskfile Taskfile.yaml deploy-all
+      - |
+        # Auto-update api.lab-loui.org CNAME to point to the new ALB
+        DOMAIN="lab-loui.org"
+        ALB_URL=$(kubectl get ingress -n threat-detection threat-detection-ingress \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        if [ -z "$ALB_URL" ]; then
+          echo "⏳ ALB not ready yet — run 'task dns:setup-api' manually after ALB is provisioned."
+          exit 0
+        fi
+        ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
+          --query 'HostedZones[0].Id' --output text | sed 's|/hostedzone/||')
+        if [ -z "$ZONE_ID" ]; then
+          echo "⚠️  No Route 53 hosted zone found. Skipping DNS setup."
+          exit 0
+        fi
+        aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch '{
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "api.'"$DOMAIN"'",
+              "Type": "CNAME",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "'"$ALB_URL"'"}]
+            }
+          }]
+        }' > /dev/null
+        echo "✅ api.$DOMAIN → $ALB_URL"
+
+  k8s:status:
+    desc: Show K8s resource status
+    dir: k8s
+    cmds:
+      - task --taskfile Taskfile.yaml status
+
+  k8s:get-alb:
+    desc: Get ALB URL
+    dir: k8s
+    cmds:
+      - task --taskfile Taskfile.yaml get-alb-url
+
+  k8s:logs-api:
+    desc: View API service logs
+    cmds:
+      - kubectl logs -n threat-detection -l app=api-service --tail=50
+
+  k8s:logs-inference:
+    desc: View Inference service logs
+    cmds:
+      - kubectl logs -n threat-detection -l app=inference-service --tail=50
+
+  k8s:delete:
+    desc: Delete all K8s resources
+    dir: k8s
+    cmds:
+      - task --taskfile Taskfile.yaml delete-all
+
+  # ─── DNS Tasks ───
+  dns:setup-api:
+    desc: Point api.lab-loui.org to the current ALB
+    cmds:
+      - |
+        DOMAIN="lab-loui.org"
+        ALB_URL=$(kubectl get ingress -n threat-detection threat-detection-ingress \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        if [ -z "$ALB_URL" ]; then
+          echo "❌ ALB not found. Run 'task k8s:deploy' first."
+          exit 1
+        fi
+        ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
+          --query 'HostedZones[0].Id' --output text | sed 's|/hostedzone/||')
+        aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch '{
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name": "api.'"$DOMAIN"'",
+              "Type": "CNAME",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "'"$ALB_URL"'"}]
+            }
+          }]
+        }' > /dev/null
+        echo "✅ api.$DOMAIN → $ALB_URL"
+
+  dns:destroy-api:
+    desc: Delete api.lab-loui.org DNS record
+    cmds:
+      - |
+        DOMAIN="lab-loui.org"
+        ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" \
+          --query 'HostedZones[0].Id' --output text | sed 's|/hostedzone/||')
+        RECORD=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+          --query "ResourceRecordSets[?Name=='api.$DOMAIN.']" --output json)
+        ALB_VALUE=$(echo "$RECORD" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r[0]['ResourceRecords'][0]['Value']) if r else exit(1)" 2>/dev/null || echo "")
+        if [ -z "$ALB_VALUE" ]; then
+          echo "ℹ️  No api.$DOMAIN record found"
+          exit 0
+        fi
+        aws route53 change-resource-record-sets --hosted-zone-id "$ZONE_ID" --change-batch '{
+          "Changes": [{
+            "Action": "DELETE",
+            "ResourceRecordSet": {
+              "Name": "api.'"$DOMAIN"'",
+              "Type": "CNAME",
+              "TTL": 300,
+              "ResourceRecords": [{"Value": "'"$ALB_VALUE"'"}]
+            }
+          }]
+        }' > /dev/null
+        echo "✅ api.$DOMAIN DNS record deleted"
+
+  # ─── Amplify Tasks ───
+  amplify:deploy:
+    desc: Update frontend with ALB URL and deploy to Amplify
+    dir: terraform
+    cmds:
+      - |
+        AMPLIFY_APP_ID=$(terraform output -raw amplify_app_id)
+        ALB_URL=$(kubectl get ingress -n threat-detection threat-detection-ingress \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "PENDING")
+
+        if [ "$ALB_URL" = "PENDING" ] || [ -z "$ALB_URL" ]; then
+          echo "⚠️  ALB not ready. Run 'task k8s:get-alb' to check."
+          exit 1
+        fi
+
+        echo "⏳ Verifying ALB is reachable..."
+        for i in $(seq 1 12); do
+          if curl -s -o /dev/null -w '%{http_code}' "http://$ALB_URL/health" | grep -q 200; then
+            echo "✅ ALB is healthy"
+            break
+          fi
+          if [ $i -eq 12 ]; then
+            echo "⚠️  ALB not responding yet. Deploying anyway — you may need to re-run 'task amplify:deploy' later."
+          fi
+          echo "   Waiting... ($i/12)"
+          sleep 10
+        done
+
+        ACM_CERT=$(aws acm list-certificates --region ${AWS_REGION} \
+          --query "CertificateSummaryList[?DomainName=='lab-loui.org' && Status=='ISSUED'].CertificateArn" --output text 2>/dev/null || echo "")
+        if [ -n "$ACM_CERT" ]; then
+          API_BASE="https://api.lab-loui.org"
+        else
+          API_BASE="http://$ALB_URL"
+        fi
+
+        mkdir -p ../amplify_deploy
+        sed "s|%%ALB_ENDPOINT%%|$API_BASE|g" ../amplify_package/index.html > ../amplify_deploy/index.html
+        cp ../amplify_package/result.html ../amplify_deploy/result.html
+
+        cd ../amplify_deploy
+        zip -r ../threat-detection-app.zip .
+
+        DEPLOY_RESULT=$(aws amplify create-deployment \
+          --app-id "$AMPLIFY_APP_ID" \
+          --branch-name main \
+          --region ${AWS_REGION} \
+          --output json)
+
+        JOB_ID=$(echo "$DEPLOY_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['jobId'])")
+        UPLOAD_URL=$(echo "$DEPLOY_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['zipUploadUrl'])")
+
+        curl -T ../threat-detection-app.zip "$UPLOAD_URL" --silent --show-error
+
+        aws amplify start-deployment \
+          --app-id "$AMPLIFY_APP_ID" \
+          --branch-name main \
+          --job-id "$JOB_ID" \
+          --region ${AWS_REGION}
+
+        echo "✅ Frontend deployed with API endpoint: $API_BASE/predict"
+        echo "   Amplify URL: https://main.$AMPLIFY_APP_ID.amplifyapp.com"
+
+  # ─── Full Pipeline ───
+  deploy:full-stack:
+    desc: Deploy K8s backend + Amplify frontend (automated)
+    cmds:
+      - bash ../scripts/deploy_full_stack.sh
+
+  deploy:
+    desc: Full deployment pipeline (Terraform → Docker → K8s → Amplify)
+    cmds:
+      - bash scripts/deploy.sh
+
+  destroy:
+    desc: Full cleanup (K8s → Terraform)
+    cmds:
+      - bash scripts/destroy.sh
+
+  # ─── Data & Training ───
+  data:upload:
+    desc: Upload raw data to S3
+    dir: terraform
+    cmds:
+      - |
+        S3_BUCKET=$(terraform output -raw s3_data_bucket)
+        if [ -f ../data/raw/KDDTrain+.txt ]; then
+          aws s3 cp ../data/raw/KDDTrain+.txt "s3://$S3_BUCKET/raw/"
+          aws s3 cp ../data/raw/KDDTest+.txt "s3://$S3_BUCKET/raw/"
+          echo "✅ Raw data uploaded to s3://$S3_BUCKET/raw/"
+        else
+          echo "⚠️  No raw data found in data/raw/"
+        fi
+
+  data:preprocess:
+    desc: Run data preprocessing
+    dir: terraform
+    cmds:
+      - |
+        S3_BUCKET=$(terraform output -raw s3_data_bucket)
+        python ../data/scripts/preprocess_data.py "$S3_BUCKET" "$S3_BUCKET"
+
+  train:
+    desc: Run model training
+    cmds:
+      - python scripts/automated_training.py

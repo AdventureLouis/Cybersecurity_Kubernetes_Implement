@@ -1,0 +1,152 @@
+version: "3"
+
+env:
+  CLUSTER_NAME: Louis
+  AWS_REGION: us-east-1
+  NODE_TYPE: t3.medium
+  NODE_COUNT: "2"
+  # Set default gum style options
+  BORDER: double
+  BORDER_FOREGROUND: "212"
+  PADDING: "1 1"
+  MARGIN: "1 1"
+
+tasks:
+  aws:01-configure-cli:
+    cmds:
+      - cmd: |
+          gum style "$(cat <<EOF
+          To configure AWS CLI you need to:
+          ---
+          1. Log in or create an account at https://console.aws.amazon.com/
+          2. Create an IAM user with programmatic access
+          3. Navigate to IAM > Users > Security credentials to get access keys
+          4. Run 'aws configure' to set up credentials
+
+          Required permissions: EKS, EC2, VPC, IAM, CloudFormation
+          EOF
+          )"
+        silent: true
+      - aws configure
+      - aws sts get-caller-identity
+    desc: Configure AWS CLI credentials
+
+  aws:02-create-vpc:
+    cmds:
+      - |
+        aws ec2 create-vpc \
+          --cidr-block 10.0.0.0/16 \
+          --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${CLUSTER_NAME}}]" \
+          --region ${AWS_REGION}
+    desc: Create VPC for EKS cluster
+  
+
+  aws:03-create-cluster:
+    cmds:
+      - |
+        eksctl create cluster \
+          --name ${CLUSTER_NAME} \
+          --region ${AWS_REGION} \
+          --nodegroup-name standard-workers \
+          --node-type ${NODE_TYPE} \
+          --nodes ${NODE_COUNT} \
+          --managed
+    desc: Create EKS cluster with eksctl
+
+  aws:03a-create-oidc:
+    cmds:
+      - |
+        eksctl utils associate-iam-oidc-provider \
+          --cluster ${CLUSTER_NAME} \
+          --region ${AWS_REGION} \
+          --approve
+    desc: Create OIDC provider for EKS cluster
+
+  aws:04-create-all:
+    cmds:
+      - task: aws:03-create-cluster
+      - task: aws:03a-create-oidc
+    desc: Create the EKS cluster and OIDC provider (VPC created automatically by eksctl)
+
+  aws:05-get-kubeconfig:
+    cmds:
+      - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+    desc: Update kubeconfig for the EKS cluster
+
+  aws:06-clean-up:
+    cmds:
+      - eksctl delete cluster --name ${CLUSTER_NAME} --region ${AWS_REGION} --wait
+    desc: Delete the EKS cluster and associated resources
+
+  aws:07-clean-vpc:
+    cmds:
+      - |
+        VPC_ID=$(aws ec2 describe-vpcs \
+          --filters "Name=tag:Name,Values=${CLUSTER_NAME}" \
+          --query 'Vpcs[0].VpcId' \
+          --region ${AWS_REGION} \
+          --output text)
+
+        if [[ "$VPC_ID" == "None" ]]; then
+          echo "ℹ️ No VPC found — skipping VPC cleanup"
+          exit 0
+        fi
+
+        echo "🧹 Cleaning VPC: $VPC_ID"
+
+        # Subnets
+        for subnet in $(aws ec2 describe-subnets \
+          --filters "Name=vpc-id,Values=$VPC_ID" \
+          --query 'Subnets[].SubnetId' \
+          --region ${AWS_REGION} \
+          --output text); do
+            aws ec2 delete-subnet --subnet-id $subnet --region ${AWS_REGION}
+        done
+
+        # Internet Gateway
+        IGW_ID=$(aws ec2 describe-internet-gateways \
+          --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+          --query 'InternetGateways[0].InternetGatewayId' \
+          --region ${AWS_REGION} \
+          --output text)
+
+        if [[ "$IGW_ID" != "None" ]]; then
+          aws ec2 detach-internet-gateway \
+            --internet-gateway-id $IGW_ID \
+            --vpc-id $VPC_ID \
+            --region ${AWS_REGION}
+
+          aws ec2 delete-internet-gateway \
+            --internet-gateway-id $IGW_ID \
+            --region ${AWS_REGION}
+        fi
+
+        aws ec2 delete-vpc \
+          --vpc-id $VPC_ID \
+          --region ${AWS_REGION}
+    desc: Clean up the VPC created for the EKS cluster
+
+  aws:08-connect-to-cluster:
+    cmds:
+      - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+    desc: Connect to the EKS cluster
+
+  kind:01-generate-config:
+    cmds:
+      - REPLACE_WITH_ABSOLUTE_PATH=${PWD} envsubst < kind-config.yaml.TEMPLATE > kind-config.yaml
+    desc: "Generate kind config with local absolute paths for PV mounts"
+
+  kind:02-create-cluster:
+    cmds:
+      - kind create cluster --config kind-config.yaml
+    desc: Create a Kubernetes cluster using kind
+
+  kind:03-run-cloud-provider-kind:
+    desc: "Run sigs.k8s.io/cloud-provider-kind@latest to enable load balancer services with KinD"
+    cmds:
+      - sudo cloud-provider-kind
+
+  kind:04-delete-cluster:
+    cmds:
+      - kind delete cluster
+    desc: Delete and existing a kind Kubernetes cluster
