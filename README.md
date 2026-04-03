@@ -149,3 +149,10 @@ kubectl get deployment inference-service -n threat-detection -o jsonpath='{.spec
 # Manually update inference endpoint without redeploying
 kubectl set env deployment/inference-service -n threat-detection SAGEMAKER_ENDPOINT_NAME=<endpoint-name>
 ```
+
+##Demo
+
+https://github.com/user-attachments/assets/008b5055-92bd-4b68-bc45-6015725fc69e
+
+
+
