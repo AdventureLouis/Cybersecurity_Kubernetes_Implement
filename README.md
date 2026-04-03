@@ -152,7 +152,7 @@ kubectl set env deployment/inference-service -n threat-detection SAGEMAKER_ENDPO
 
 ##Demo
 <br>
-The demo below illustrates the implementation outome on AWS console,Kubernetes UI and and front-end in amplify
+The demo below illustrates the implementation outome on AWS console,Kubernetes UI and and front-end in amplify.
 
 https://github.com/user-attachments/assets/008b5055-92bd-4b68-bc45-6015725fc69e
 
